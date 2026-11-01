@@ -1,0 +1,13 @@
+# VPS propio con HTTPS automático: cambia gotta.midominio.com por tu dominio (apuntando a la IP del VPS) y ejecuta `docker compose up -d`
+services:
+  gotta:
+    build: .
+    restart: unless-stopped
+    volumes: [ "gotta-data:/data" ]
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports: [ "80:80", "443:443" ]
+    command: caddy reverse-proxy --from gotta.midominio.com --to gotta:3000
+    volumes: [ "caddy-data:/data" ]
+volumes: { gotta-data: {}, caddy-data: {} }

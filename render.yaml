@@ -1,0 +1,11 @@
+# Render: "New > Blueprint" y elige este repositorio. Los discos persistentes requieren una instancia de pago.
+services:
+  - type: web
+    name: gotta
+    runtime: docker
+    plan: starter
+    healthCheckPath: /healthz
+    disk:
+      name: gotta-data
+      mountPath: /data
+      sizeGB: 1
