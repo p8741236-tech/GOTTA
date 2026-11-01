@@ -7,20 +7,56 @@ import zlib from 'node:zlib';
 import crypto from 'node:crypto';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
-import { DatabaseSync } from 'node:sqlite';
+import { Pg } from './pg.js';
 
 const scrypt = promisify(crypto.scrypt);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = +process.env.PORT || 3000;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+const DATABASE_URL = process.env.DATABASE_URL || '';
 const TRUST_PROXY = process.env.TRUST_PROXY === '1';
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const MAX_BODY = 3 * 1024 * 1024;
 const DATA_KEYS = ['arc-p', 'arc-b', 'gotta-recent', 'gotta-ach'];
 
-fs.mkdirSync(DATA_DIR, { recursive: true });
-const db = new DatabaseSync(path.join(DATA_DIR, 'gotta.db'));
-db.exec(`
+/* ---------- almacenamiento: PostgreSQL (DATABASE_URL) o SQLite en disco ---------- */
+const store = await (async () => {
+  if (DATABASE_URL) {
+    const pg = new Pg(DATABASE_URL);
+    try { await pg.exec(`
+CREATE TABLE IF NOT EXISTS users(
+  id BIGSERIAL PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT NOT NULL, avatar TEXT NOT NULL, color TEXT NOT NULL,
+  bio TEXT NOT NULL DEFAULT '', pw TEXT NOT NULL, data TEXT NOT NULL DEFAULT '{}', rev INTEGER NOT NULL DEFAULT 0,
+  created BIGINT NOT NULL, updated BIGINT NOT NULL);
+CREATE TABLE IF NOT EXISTS sessions(
+  token_hash TEXT PRIMARY KEY, user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created BIGINT NOT NULL, last_seen BIGINT NOT NULL, ua TEXT);
+CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);`); } catch (e) { console.error('No se pudo conectar con la base de datos (DATABASE_URL): ' + e.message); process.exit(1); }
+    const one = async (sql, p) => (await pg.query(sql, p)).rows[0] || null;
+    return {
+      kind: 'postgres',
+      userByEmail: e => one('SELECT * FROM users WHERE email=$1', [e]),
+      userById: id => one('SELECT * FROM users WHERE id=$1', [id]),
+      // devuelve el id nuevo o null si el correo ya existía
+      insUser: async (email, name, avatar, color, pw, data, now) =>
+        (await one('INSERT INTO users(email,name,avatar,color,pw,data,rev,created,updated) VALUES($1,$2,$3,$4,$5,$6,1,$7,$7) ON CONFLICT (email) DO NOTHING RETURNING id', [email, name, avatar, color, pw, data, now]))?.id ?? null,
+      insSess: (th, uid, now, ua) => pg.query('INSERT INTO sessions(token_hash,user_id,created,last_seen,ua) VALUES($1,$2,$3,$3,$4)', [th, uid, now, ua]),
+      sess: th => one('SELECT s.token_hash,s.last_seen,u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1', [th]),
+      touch: (now, th) => pg.query('UPDATE sessions SET last_seen=$1 WHERE token_hash=$2', [now, th]),
+      delSess: th => pg.query('DELETE FROM sessions WHERE token_hash=$1', [th]),
+      delOthers: (uid, th) => pg.query('DELETE FROM sessions WHERE user_id=$1 AND token_hash<>$2', [uid, th]),
+      trimSess: uid => pg.query('DELETE FROM sessions WHERE user_id=$1 AND token_hash NOT IN (SELECT token_hash FROM sessions WHERE user_id=$1 ORDER BY last_seen DESC LIMIT 500)', [uid]),
+      setData: async (data, now, uid, rev) => (await pg.query('UPDATE users SET data=$1,rev=rev+1,updated=$2 WHERE id=$3 AND rev=$4', [data, now, uid, rev])).count,
+      setProfile: (a, c, b, now, uid) => pg.query('UPDATE users SET avatar=$1,color=$2,bio=$3,updated=$4 WHERE id=$5', [a, c, b, now, uid]),
+      setPw: (pw, now, uid) => pg.query('UPDATE users SET pw=$1,updated=$2 WHERE id=$3', [pw, now, uid]),
+      delUser: uid => pg.query('DELETE FROM users WHERE id=$1', [uid]),
+      close: () => pg.close(),
+    };
+  }
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  const { DatabaseSync } = await import('node:sqlite');
+  const db = new DatabaseSync(path.join(DATA_DIR, 'gotta.db'));
+  db.exec(`
 PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;
 CREATE TABLE IF NOT EXISTS users(
   id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
@@ -31,23 +67,30 @@ CREATE TABLE IF NOT EXISTS sessions(
   token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   created INTEGER NOT NULL, last_seen INTEGER NOT NULL, ua TEXT);
 CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);`);
-
-const q = {
-  userByEmail: db.prepare('SELECT * FROM users WHERE email=?'),
-  userById: db.prepare('SELECT * FROM users WHERE id=?'),
-  insUser: db.prepare('INSERT INTO users(email,name,avatar,color,pw,data,rev,created,updated) VALUES(?,?,?,?,?,?,1,?,?)'),
-  insSess: db.prepare('INSERT INTO sessions(token_hash,user_id,created,last_seen,ua) VALUES(?,?,?,?,?)'),
-  sess: db.prepare('SELECT s.token_hash,s.last_seen,u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=?'),
-  touch: db.prepare('UPDATE sessions SET last_seen=? WHERE token_hash=?'),
-  delSess: db.prepare('DELETE FROM sessions WHERE token_hash=?'),
-  delOthers: db.prepare('DELETE FROM sessions WHERE user_id=? AND token_hash<>?'),
-  trimSess: db.prepare('DELETE FROM sessions WHERE user_id=? AND token_hash NOT IN (SELECT token_hash FROM sessions WHERE user_id=? ORDER BY last_seen DESC LIMIT 500)'),
-  setData: db.prepare('UPDATE users SET data=?,rev=rev+1,updated=? WHERE id=? AND rev=?'),
-  setProfile: db.prepare('UPDATE users SET avatar=?,color=?,bio=?,updated=? WHERE id=?'),
-  setPw: db.prepare('UPDATE users SET pw=?,updated=? WHERE id=?'),
-  delUser: db.prepare('DELETE FROM users WHERE id=?'),
-};
-const tx = fn => { db.exec('BEGIN IMMEDIATE'); try { const r = fn(); db.exec('COMMIT'); return r; } catch (e) { db.exec('ROLLBACK'); throw e; } };
+  const s = {
+    userByEmail: db.prepare('SELECT * FROM users WHERE email=?'), userById: db.prepare('SELECT * FROM users WHERE id=?'),
+    insUser: db.prepare('INSERT OR IGNORE INTO users(email,name,avatar,color,pw,data,rev,created,updated) VALUES(?,?,?,?,?,?,1,?,?)'),
+    insSess: db.prepare('INSERT INTO sessions(token_hash,user_id,created,last_seen,ua) VALUES(?,?,?,?,?)'),
+    sess: db.prepare('SELECT s.token_hash,s.last_seen,u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=?'),
+    touch: db.prepare('UPDATE sessions SET last_seen=? WHERE token_hash=?'), delSess: db.prepare('DELETE FROM sessions WHERE token_hash=?'),
+    delOthers: db.prepare('DELETE FROM sessions WHERE user_id=? AND token_hash<>?'),
+    trimSess: db.prepare('DELETE FROM sessions WHERE user_id=? AND token_hash NOT IN (SELECT token_hash FROM sessions WHERE user_id=? ORDER BY last_seen DESC LIMIT 500)'),
+    setData: db.prepare('UPDATE users SET data=?,rev=rev+1,updated=? WHERE id=? AND rev=?'),
+    setProfile: db.prepare('UPDATE users SET avatar=?,color=?,bio=?,updated=? WHERE id=?'), setPw: db.prepare('UPDATE users SET pw=?,updated=? WHERE id=?'),
+    delUser: db.prepare('DELETE FROM users WHERE id=?'),
+  };
+  return {
+    kind: 'sqlite',
+    userByEmail: async e => s.userByEmail.get(e) || null, userById: async id => s.userById.get(id) || null,
+    insUser: async (email, name, avatar, color, pw, data, now) => { const r = s.insUser.run(email, name, avatar, color, pw, data, now, now); return r.changes ? Number(r.lastInsertRowid) : null; },
+    insSess: async (th, uid, now, ua) => { s.insSess.run(th, uid, now, now, ua); },
+    sess: async th => s.sess.get(th) || null, touch: async (now, th) => { s.touch.run(now, th); }, delSess: async th => { s.delSess.run(th); },
+    delOthers: async (uid, th) => { s.delOthers.run(uid, th); }, trimSess: async uid => { s.trimSess.run(uid, uid); },
+    setData: async (data, now, uid, rev) => s.setData.run(data, now, uid, rev).changes,
+    setProfile: async (a, c, b, now, uid) => { s.setProfile.run(a, c, b, now, uid); }, setPw: async (pw, now, uid) => { s.setPw.run(pw, now, uid); },
+    delUser: async uid => { s.delUser.run(uid); }, close: () => db.close(),
+  };
+})();
 
 /* ---------- utilidades ---------- */
 const sha = s => crypto.createHash('sha256').update(s).digest('hex');
@@ -111,18 +154,18 @@ function readBody(req) {
     req.on('error', reject);
   });
 }
-function authed(req) {
+async function authed(req) {
   const m = /^Bearer ([A-Za-z0-9_-]{20,100})$/.exec(req.headers.authorization || '');
   if (!m) throw new HttpErr(401, 'Sesión no válida. Inicia sesión de nuevo.');
-  const th = sha(m[1]); const row = q.sess.get(th);
+  const th = sha(m[1]); const row = await store.sess(th);
   if (!row) throw new HttpErr(401, 'Sesión cerrada. Inicia sesión de nuevo.');
-  if (Date.now() - row.last_seen > 36e5) q.touch.run(Date.now(), th);
+  if (Date.now() - row.last_seen > 36e5) await store.touch(Date.now(), th);
   return { th, user: row };
 }
-function newSession(userId, req) {
+async function newSession(userId, req) {
   const token = crypto.randomBytes(32).toString('base64url');
-  q.insSess.run(sha(token), userId, Date.now(), Date.now(), String(req.headers['user-agent'] || '').slice(0, 200));
-  q.trimSess.run(userId, userId);
+  await store.insSess(sha(token), userId, Date.now(), String(req.headers['user-agent'] || '').slice(0, 200));
+  await store.trimSess(userId);
   return token;
 }
 
@@ -135,57 +178,53 @@ const routes = {
     if (!NAME_RX.test(name)) throw new HttpErr(400, 'El nombre debe tener entre 3 y 20 caracteres (letras, números, espacio, _ . -).');
     if (pw.length < 8 || pw.length > 200) throw new HttpErr(400, 'La contraseña debe tener al menos 8 caracteres.');
     let data = {}; if (b.data != null) { data = cleanData(b.data); if (!data) throw new HttpErr(400, 'Progreso no válido.'); }
-    if (q.userByEmail.get(email)) throw new HttpErr(409, 'Ya existe una cuenta con ese correo. Inicia sesión.');
     const pwh = await hashPw(pw), now = Date.now();
-    const out = tx(() => {
-      if (q.userByEmail.get(email)) throw new HttpErr(409, 'Ya existe una cuenta con ese correo. Inicia sesión.');
-      const r = q.insUser.run(email, name, cleanAvatar(b.avatar), cleanColor(b.color), pwh, JSON.stringify(data), now, now);
-      const id = Number(r.lastInsertRowid);
-      return { id, token: newSession(id, req) };
-    });
-    return [201, { token: out.token, user: publicUser(q.userById.get(out.id)) }];
+    const id = await store.insUser(email, name, cleanAvatar(b.avatar), cleanColor(b.color), pwh, JSON.stringify(data), now);
+    if (id == null) throw new HttpErr(409, 'Ya existe una cuenta con ese correo. Inicia sesión.');
+    const token = await newSession(id, req);
+    return [201, { token, user: publicUser(await store.userById(id)) }];
   },
   'POST /api/login': async (req) => {
     const b = await readBody(req);
     const email = String(b.email || '').trim().toLowerCase(), pw = String(b.password || '');
     if (limited('li:ip:' + ip(req), 30, 15 * 60e3) || limited('li:em:' + email, 10, 15 * 60e3))
       throw new HttpErr(429, 'Demasiados intentos. Espera unos minutos e inténtalo de nuevo.');
-    const u = q.userByEmail.get(email);
+    const u = await store.userByEmail(email);
     const ok = u ? await checkPw(pw, u.pw) : (await checkPw(pw, await DUMMY), false);
     if (!ok) throw new HttpErr(401, 'Correo o contraseña incorrectos.');
     hits.delete('li:em:' + email);
-    return [200, { token: newSession(u.id, req), user: publicUser(u) }];
+    return [200, { token: await newSession(u.id, req), user: publicUser(u) }];
   },
-  'POST /api/logout': async (req) => { const { th } = authed(req); q.delSess.run(th); return [200, { ok: true }]; },
-  'GET /api/me': async (req) => { const { user } = authed(req); return [200, { user: publicUser(user) }]; },
+  'POST /api/logout': async (req) => { const { th } = await authed(req); await store.delSess(th); return [200, { ok: true }]; },
+  'GET /api/me': async (req) => { const { user } = await authed(req); return [200, { user: publicUser(user) }]; },
   'PUT /api/data': async (req) => {
-    const { user } = authed(req);
+    const { user } = await authed(req);
     const b = await readBody(req); const data = cleanData(b.data);
     if (!data) throw new HttpErr(400, 'Progreso no válido.');
-    const r = q.setData.run(JSON.stringify(data), Date.now(), user.id, Number(b.rev) | 0);
-    if (!r.changes) throw new HttpErr(409, 'Hay una versión más reciente en la nube.', { user: publicUser(q.userById.get(user.id)) });
-    return [200, { rev: q.userById.get(user.id).rev }];
+    const changed = await store.setData(JSON.stringify(data), Date.now(), user.id, Number(b.rev) | 0);
+    if (!changed) throw new HttpErr(409, 'Hay una versión más reciente en la nube.', { user: publicUser(await store.userById(user.id)) });
+    return [200, { rev: (await store.userById(user.id)).rev }];
   },
   'PUT /api/profile': async (req) => {
-    const { user } = authed(req); const b = await readBody(req);
-    q.setProfile.run(cleanAvatar(b.avatar ?? user.avatar), cleanColor(b.color ?? user.color), cleanBio(b.bio ?? user.bio), Date.now(), user.id);
+    const { user } = await authed(req); const b = await readBody(req);
+    await store.setProfile(cleanAvatar(b.avatar ?? user.avatar), cleanColor(b.color ?? user.color), cleanBio(b.bio ?? user.bio), Date.now(), user.id);
     return [200, { ok: true }];
   },
   'POST /api/password': async (req) => {
-    const { th, user } = authed(req); const b = await readBody(req);
+    const { th, user } = await authed(req); const b = await readBody(req);
     if (limited('pw:' + user.id, 10, 15 * 60e3)) throw new HttpErr(429, 'Demasiados intentos. Espera unos minutos.');
     const next = String(b.next || '');
     if (next.length < 8 || next.length > 200) throw new HttpErr(400, 'La nueva contraseña debe tener al menos 8 caracteres.');
     if (!(await checkPw(String(b.current || ''), user.pw))) throw new HttpErr(403, 'La contraseña actual no es correcta.');
-    q.setPw.run(await hashPw(next), Date.now(), user.id);
-    q.delOthers.run(user.id, th); // cierra la sesión en los demás dispositivos
+    await store.setPw(await hashPw(next), Date.now(), user.id);
+    await store.delOthers(user.id, th); // cierra la sesión en los demás dispositivos
     return [200, { ok: true }];
   },
   'DELETE /api/account': async (req) => {
-    const { user } = authed(req); const b = await readBody(req);
+    const { user } = await authed(req); const b = await readBody(req);
     if (limited('del:' + user.id, 10, 15 * 60e3)) throw new HttpErr(429, 'Demasiados intentos. Espera unos minutos.');
     if (!(await checkPw(String(b.password || ''), user.pw))) throw new HttpErr(403, 'Contraseña incorrecta.');
-    q.delUser.run(user.id);
+    await store.delUser(user.id);
     return [200, { ok: true }];
   },
 };
@@ -243,5 +282,5 @@ const server = http.createServer(async (req, res) => {
   }
 });
 server.requestTimeout = 30000;
-server.listen(PORT, () => console.log(`Gotta escuchando en http://localhost:${PORT} · datos en ${DATA_DIR}`));
-for (const s of ['SIGINT', 'SIGTERM']) process.on(s, () => { server.close(); try { db.close(); } catch {} process.exit(0); });
+server.listen(PORT, () => console.log(`Gotta escuchando en http://localhost:${PORT} · base de datos: ${store.kind}${store.kind === 'sqlite' ? ' en ' + DATA_DIR : ''}`));
+for (const s of ['SIGINT', 'SIGTERM']) process.on(s, () => { server.close(); try { store.close(); } catch {} process.exit(0); });

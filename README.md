@@ -1,6 +1,13 @@
 # Gotta con cuentas reales
 
-Servidor sin dependencias (solo Node >= 22.13). Guarda las cuentas en SQLite y sirve la web.
+Servidor sin dependencias (Node 22+). Sirve la web de Gotta y guarda cuentas y progreso en **PostgreSQL**
+(variable `DATABASE_URL`, p. ej. Neon) o, si no la defines, en **SQLite** dentro de `DATA_DIR`.
+
+## Gratis: Render + Neon
+1. neon.tech → crea cuenta y un proyecto (región Frankfurt). Copia la *connection string* (`postgresql://...neon.tech/...?sslmode=require`).
+2. Render → New → Blueprint → este repositorio → pega esa cadena en `DATABASE_URL` → Apply.
+3. Render gratis duerme el servicio tras ~15 min sin visitas y tarda ~1 min en despertar; las cuentas NO se pierden porque están en Neon.
+   Para evitar el sueño, crea un monitor gratuito en uptimerobot.com que abra `https://TU-APP.onrender.com/healthz` cada 5 min.
 
 ## Probarlo en tu ordenador (necesita Node 22.13+ de nodejs.org)
 Doble clic en `start.bat` (Windows) o `./start.sh` (Mac/Linux) y abre http://localhost:3000

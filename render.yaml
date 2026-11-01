@@ -1,11 +1,13 @@
-# Render: "New > Blueprint" y elige este repositorio. Los discos persistentes requieren una instancia de pago.
+# Render (plan gratis) + base de datos PostgreSQL externa gratuita (Neon). Las cuentas viven en Neon, no en Render.
 services:
   - type: web
     name: gotta
     runtime: docker
-    plan: starter
+    plan: free
+    region: frankfurt
     healthCheckPath: /healthz
-    disk:
-      name: gotta-data
-      mountPath: /data
-      sizeGB: 1
+    envVars:
+      - key: DATABASE_URL
+        sync: false   # Render te pedirá pegar aquí la cadena de conexión de Neon
+      - key: TRUST_PROXY
+        value: "1"
